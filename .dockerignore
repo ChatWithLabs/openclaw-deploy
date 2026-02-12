@@ -1,0 +1,38 @@
+# Agent workspace files (not part of the deployment)
+IDENTITY.md
+BOOTSTRAP.md
+SOUL.md
+USER.md
+AGENTS.md
+TOOLS.md
+HEARTBEAT.md
+LESSONS.md
+AGENT_ONBOARDING.md
+AGENT_CODING_STANDARDS.md
+GRAPH_SCHEMA.md
+CYPHER_INSIGHTS.md
+TASK_MASTER.json
+security-audit-sec-001.md
+memory/
+
+# Git and editor
+.git
+.gitignore
+.vscode
+.idea
+
+# Docs
+LICENSE
+README.md
+*.md
+!src/**
+
+# CI
+.github/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Node
+node_modules/

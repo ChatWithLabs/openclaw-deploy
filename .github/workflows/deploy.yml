@@ -1,0 +1,76 @@
+name: Build & Deploy
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Check for new upstream openclaw releases daily at 06:00 UTC
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      openclaw_ref:
+        description: "OpenClaw git ref (tag/branch) to build"
+        required: false
+        default: "main"
+
+permissions:
+  contents: write
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      latest_ref: ${{ steps.check.outputs.latest_ref }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for new upstream release
+        id: check
+        run: |
+          # Get latest tag from upstream openclaw
+          LATEST_TAG=$(git ls-remote --tags --sort=-v:refname https://github.com/openclaw/openclaw.git | head -1 | sed 's/.*refs\/tags\///' | sed 's/\^{}//')
+          echo "Latest upstream tag: $LATEST_TAG"
+
+          # Read last built ref from our tracking file
+          LAST_BUILT=$(cat .openclaw-version 2>/dev/null || echo "none")
+          echo "Last built: $LAST_BUILT"
+
+          if [ "$LATEST_TAG" != "$LAST_BUILT" ] || [ "${{ github.event_name }}" = "push" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            # Use workflow input if provided, else latest tag, else main
+            REF="${{ github.event.inputs.openclaw_ref }}"
+            if [ -z "$REF" ] || [ "$REF" = "main" ]; then
+              REF="${LATEST_TAG:-main}"
+            fi
+            echo "latest_ref=$REF" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "latest_ref=$LAST_BUILT" >> "$GITHUB_OUTPUT"
+          fi
+
+  deploy:
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record version
+        run: |
+          echo "${{ needs.check-upstream.outputs.latest_ref }}" > .openclaw-version
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .openclaw-version
+          git diff --cached --quiet || git commit -m "chore: bump openclaw to ${{ needs.check-upstream.outputs.latest_ref }}"
+          git push || true
+
+      - name: Trigger Northflank rebuild
+        if: env.NORTHFLANK_WEBHOOK_URL != ''
+        env:
+          NORTHFLANK_WEBHOOK_URL: ${{ secrets.NORTHFLANK_WEBHOOK_URL }}
+        run: |
+          curl -sf -X POST "$NORTHFLANK_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d '{"ref": "${{ needs.check-upstream.outputs.latest_ref }}"}'
+          echo "Northflank rebuild triggered"
