@@ -93,6 +93,27 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+// Harden file permissions on startup so sensitive files aren't world-readable.
+// Runs once at boot; no-ops on platforms without chmod support.
+function hardenPermissions() {
+  try {
+    fs.chmodSync(STATE_DIR, 0o700);
+  } catch { /* ignore if dir doesn't exist yet */ }
+  const sensitiveFiles = [
+    path.join(STATE_DIR, "openclaw.json"),
+    path.join(STATE_DIR, "gateway.token"),
+    path.join(STATE_DIR, "credentials", "telegram-allowFrom.json"),
+    path.join(STATE_DIR, "credentials", "telegram-pairing.json"),
+    path.join(STATE_DIR, "agents", "main", "agent", "auth-profiles.json"),
+    path.join(STATE_DIR, "agents", "main", "agent", "models.json"),
+    path.join(STATE_DIR, "agents", "main", "sessions", "sessions.json"),
+  ];
+  for (const f of sensitiveFiles) {
+    try { fs.chmodSync(f, 0o600); } catch { /* skip missing */ }
+  }
+}
+hardenPermissions();
+
 async function waitForGatewayReady(opts = {}) {
   const timeoutMs = opts.timeoutMs ?? 20_000;
   const start = Date.now();
