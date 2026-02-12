@@ -141,14 +141,7 @@ async function startGateway() {
 
   gatewayProc = childProcess.spawn(OPENCLAW_NODE, clawArgs(args), {
     stdio: "inherit",
-    env: {
-      ...process.env,
-      OPENCLAW_STATE_DIR: STATE_DIR,
-      OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
-      // Backward-compat aliases
-      CLAWDBOT_STATE_DIR: process.env.CLAWDBOT_STATE_DIR || STATE_DIR,
-      CLAWDBOT_WORKSPACE_DIR: process.env.CLAWDBOT_WORKSPACE_DIR || WORKSPACE_DIR,
-    },
+    env: safeEnv(),
   });
 
   gatewayProc.on("error", (err) => {
@@ -222,12 +215,12 @@ const app = express();
 app.disable("x-powered-by");
 app.use(express.json({ limit: "1mb" }));
 
-// Health endpoint - reports actual gateway status for Northflank probes.
+// Health endpoint for Northflank probes. Minimal response to avoid leaking state.
 app.get("/setup/healthz", (_req, res) => {
   const configured = isConfigured();
   const gatewayUp = Boolean(gatewayProc && !gatewayProc.killed);
-  const ok = !configured || gatewayUp; // healthy if unconfigured (setup pending) OR gateway running
-  res.status(ok ? 200 : 503).json({ ok, configured, gatewayUp });
+  const ok = !configured || gatewayUp;
+  res.status(ok ? 200 : 503).json({ ok });
 });
 
 app.get("/setup/app.js", requireSetupAuth, (_req, res) => {
@@ -450,7 +443,7 @@ function buildOnboardArgs(payload) {
     "--gateway-token",
     OPENCLAW_GATEWAY_TOKEN,
     "--flow",
-    payload.flow || "quickstart"
+    VALID_FLOWS.has(payload.flow) ? payload.flow : "quickstart"
   ];
 
   if (payload.authChoice) {
@@ -486,30 +479,71 @@ function buildOnboardArgs(payload) {
   return args;
 }
 
+const MAX_CMD_OUTPUT = 2 * 1024 * 1024; // 2MB output cap
+const CMD_TIMEOUT_MS = 30_000; // 30s default timeout
+
+// Whitelist of safe env vars to pass to child processes.
+const SAFE_ENV_KEYS = new Set([
+  "PATH", "HOME", "USER", "LANG", "LC_ALL", "NODE_ENV", "NODE_OPTIONS",
+  "TERM", "SHELL", "HOSTNAME", "TZ",
+  "OPENCLAW_STATE_DIR", "OPENCLAW_WORKSPACE_DIR", "OPENCLAW_GATEWAY_TOKEN",
+  "OPENCLAW_CONFIG_PATH", "OPENCLAW_ENTRY", "OPENCLAW_NODE",
+  "CLAWDBOT_STATE_DIR", "CLAWDBOT_WORKSPACE_DIR", "CLAWDBOT_GATEWAY_TOKEN",
+  "CLAWDBOT_CONFIG_PATH",
+]);
+
+function safeEnv() {
+  const env = {};
+  for (const key of SAFE_ENV_KEYS) {
+    if (process.env[key] !== undefined) env[key] = process.env[key];
+  }
+  env.OPENCLAW_STATE_DIR = STATE_DIR;
+  env.OPENCLAW_WORKSPACE_DIR = WORKSPACE_DIR;
+  env.CLAWDBOT_STATE_DIR = process.env.CLAWDBOT_STATE_DIR || STATE_DIR;
+  env.CLAWDBOT_WORKSPACE_DIR = process.env.CLAWDBOT_WORKSPACE_DIR || WORKSPACE_DIR;
+  return env;
+}
+
 function runCmd(cmd, args, opts = {}) {
+  const timeoutMs = opts.timeoutMs ?? CMD_TIMEOUT_MS;
   return new Promise((resolve) => {
     const proc = childProcess.spawn(cmd, args, {
       ...opts,
-      env: {
-        ...process.env,
-        OPENCLAW_STATE_DIR: STATE_DIR,
-        OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
-        // Backward-compat aliases
-        CLAWDBOT_STATE_DIR: process.env.CLAWDBOT_STATE_DIR || STATE_DIR,
-        CLAWDBOT_WORKSPACE_DIR: process.env.CLAWDBOT_WORKSPACE_DIR || WORKSPACE_DIR,
-      },
+      env: safeEnv(),
     });
 
     let out = "";
-    proc.stdout?.on("data", (d) => (out += d.toString("utf8")));
-    proc.stderr?.on("data", (d) => (out += d.toString("utf8")));
+    let truncated = false;
+    const appendOutput = (d) => {
+      if (truncated) return;
+      const chunk = d.toString("utf8");
+      if (out.length + chunk.length > MAX_CMD_OUTPUT) {
+        out += chunk.slice(0, MAX_CMD_OUTPUT - out.length);
+        out += "\n[output truncated at 2MB]\n";
+        truncated = true;
+      } else {
+        out += chunk;
+      }
+    };
+    proc.stdout?.on("data", appendOutput);
+    proc.stderr?.on("data", appendOutput);
+
+    const timer = setTimeout(() => {
+      try { proc.kill("SIGKILL"); } catch {}
+      out += "\n[process killed: timeout after " + (timeoutMs / 1000) + "s]\n";
+      resolve({ code: 124, output: out });
+    }, timeoutMs);
 
     proc.on("error", (err) => {
+      clearTimeout(timer);
       out += `\n[spawn error] ${String(err)}\n`;
       resolve({ code: 127, output: out });
     });
 
-    proc.on("close", (code) => resolve({ code: code ?? 0, output: out }));
+    proc.on("close", (code) => {
+      clearTimeout(timer);
+      resolve({ code: code ?? 0, output: out });
+    });
   });
 }
 
@@ -541,6 +575,8 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
     await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.port", String(INTERNAL_GATEWAY_PORT)]));
     // Trust the wrapper's reverse proxy so the UI WebSocket works through the proxy chain.
     await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.trustedProxies", '["127.0.0.1","::1"]']));
+    // Allow token-based auth without device pairing (required for proxied Control UI access).
+    await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "--json", "gateway.controlUi.allowInsecureAuth", "true"]));
 
     const channelsHelp = await runCmd(OPENCLAW_NODE, clawArgs(["channels", "add", "--help"]));
     const helpText = channelsHelp.output || "";
@@ -622,7 +658,7 @@ app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
   });
   } catch (err) {
     console.error("[/setup/api/run] error:", err);
-    return res.status(500).json({ ok: false, output: `Internal error: ${String(err)}` });
+    return res.status(500).json({ ok: false, output: "Internal error during setup. Check server logs." });
   }
 });
 
@@ -662,8 +698,44 @@ function redactSecrets(text) {
     .replace(/(xapp-[A-Za-z0-9-]{10,})/g, "[REDACTED]")
     .replace(/(\d{8,12}:[A-Za-z0-9_-]{30,})/g, "[REDACTED]") // Telegram bot tokens
     .replace(/(syn_[A-Za-z0-9_-]{10,})/g, "[REDACTED]")
+    .replace(/(AKIA[A-Z0-9]{12,})/g, "[REDACTED]") // AWS access keys
+    .replace(/(ASIA[A-Z0-9]{12,})/g, "[REDACTED]") // AWS temp keys
+    .replace(/(AIza[A-Za-z0-9_-]{30,})/g, "[REDACTED]") // Google API keys
+    .replace(/(ya29\.[A-Za-z0-9_-]{30,})/g, "[REDACTED]") // Google OAuth tokens
     .replace(/(AA[A-Za-z0-9_-]{10,}:\S{10,})/g, "[REDACTED]");
 }
+
+// --- Rate limiter ---
+const rateLimitMap = new Map();
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX = 30; // 30 requests per minute per IP
+
+function rateLimit(req, res, next) {
+  const ip = req.ip || req.socket.remoteAddress || "unknown";
+  const now = Date.now();
+  let entry = rateLimitMap.get(ip);
+  if (!entry || now - entry.windowStart > RATE_LIMIT_WINDOW_MS) {
+    entry = { windowStart: now, count: 0 };
+    rateLimitMap.set(ip, entry);
+  }
+  entry.count++;
+  if (entry.count > RATE_LIMIT_MAX) {
+    return res.status(429).json({ ok: false, error: "Too many requests" });
+  }
+  // Periodically clean stale entries
+  if (rateLimitMap.size > 1000) {
+    for (const [key, val] of rateLimitMap) {
+      if (now - val.windowStart > RATE_LIMIT_WINDOW_MS) rateLimitMap.delete(key);
+    }
+  }
+  return next();
+}
+
+// --- Input validation ---
+const VALID_CONFIG_KEY = /^[a-zA-Z0-9_]+(\.[a-zA-Z0-9_]+)*$/;
+const VALID_CHANNELS = new Set(["telegram", "discord", "slack"]);
+const VALID_PAIRING_CODE = /^[A-Za-z0-9]{2,20}$/;
+const VALID_FLOWS = new Set(["quickstart", "advanced", "manual"]);
 
 const ALLOWED_CONSOLE_COMMANDS = new Set([
   // Wrapper-managed lifecycle
@@ -680,7 +752,7 @@ const ALLOWED_CONSOLE_COMMANDS = new Set([
   "openclaw.config.get",
 ]);
 
-app.post("/setup/api/console/run", requireSetupAuth, async (req, res) => {
+app.post("/setup/api/console/run", requireSetupAuth, rateLimit, async (req, res) => {
   const payload = req.body || {};
   const cmd = String(payload.cmd || "").trim();
   const arg = String(payload.arg || "").trim();
@@ -730,13 +802,16 @@ app.post("/setup/api/console/run", requireSetupAuth, async (req, res) => {
     }
     if (cmd === "openclaw.config.get") {
       if (!arg) return res.status(400).json({ ok: false, error: "Missing config path" });
+      if (!VALID_CONFIG_KEY.test(arg) || arg.length > 100) {
+        return res.status(400).json({ ok: false, error: "Invalid config key format" });
+      }
       const r = await runCmd(OPENCLAW_NODE, clawArgs(["config", "get", arg]));
       return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: redactSecrets(r.output) });
     }
 
     return res.status(400).json({ ok: false, error: "Unhandled command" });
   } catch (err) {
-    return res.status(500).json({ ok: false, error: String(err) });
+    return res.status(500).json({ ok: false, error: "Command failed" });
   }
 });
 
@@ -745,9 +820,10 @@ app.get("/setup/api/config/raw", requireSetupAuth, async (_req, res) => {
     const p = configPath();
     const exists = fs.existsSync(p);
     const content = exists ? fs.readFileSync(p, "utf8") : "";
-    res.json({ ok: true, path: p, exists, content });
+    res.json({ ok: true, path: p, exists, content: redactSecrets(content) });
   } catch (err) {
-    res.status(500).json({ ok: false, error: String(err) });
+    console.error("[config/raw GET]", err);
+    res.status(500).json({ ok: false, error: "Failed to read config" });
   }
 });
 
@@ -774,9 +850,10 @@ app.post("/setup/api/config/raw", requireSetupAuth, async (req, res) => {
       await restartGateway();
     }
 
-    res.json({ ok: true, path: p });
+    res.json({ ok: true });
   } catch (err) {
-    res.status(500).json({ ok: false, error: String(err) });
+    console.error("[config/raw POST]", err);
+    res.status(500).json({ ok: false, error: "Failed to save config" });
   }
 });
 
@@ -784,6 +861,12 @@ app.post("/setup/api/pairing/approve", requireSetupAuth, async (req, res) => {
   const { channel, code } = req.body || {};
   if (!channel || !code) {
     return res.status(400).json({ ok: false, error: "Missing channel or code" });
+  }
+  if (!VALID_CHANNELS.has(String(channel))) {
+    return res.status(400).json({ ok: false, error: "Invalid channel" });
+  }
+  if (!VALID_PAIRING_CODE.test(String(code))) {
+    return res.status(400).json({ ok: false, error: "Invalid code format" });
   }
   const r = await runCmd(OPENCLAW_NODE, clawArgs(["pairing", "approve", String(channel), String(code)]));
   return res.status(r.code === 0 ? 200 : 500).json({ ok: r.code === 0, output: r.output });
@@ -800,9 +883,27 @@ app.post("/setup/api/reset", requireSetupAuth, async (_req, res) => {
   }
 });
 
+function hasSymlinks(dir, depth = 0) {
+  if (depth > 10) return false; // prevent infinite recursion
+  try {
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isSymbolicLink()) return true;
+      if (entry.isDirectory()) {
+        if (hasSymlinks(path.join(dir, entry.name), depth + 1)) return true;
+      }
+    }
+  } catch { /* ignore read errors */ }
+  return false;
+}
+
 app.get("/setup/export", requireSetupAuth, async (_req, res) => {
   fs.mkdirSync(STATE_DIR, { recursive: true });
   fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
+
+  if (hasSymlinks(STATE_DIR) || hasSymlinks(WORKSPACE_DIR)) {
+    return res.status(400).type("text/plain").send("Export blocked: symlinks detected in data directories.");
+  }
 
   res.setHeader("content-type", "application/gzip");
   res.setHeader(
@@ -935,7 +1036,7 @@ app.post("/setup/import", requireSetupAuth, async (req, res) => {
     res.type("text/plain").send("OK - imported backup into /data and restarted gateway.\n");
   } catch (err) {
     console.error("[import]", err);
-    res.status(500).type("text/plain").send(String(err));
+    res.status(500).type("text/plain").send("Import failed. Check server logs.");
   }
 });
 
